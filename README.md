@@ -36,6 +36,53 @@ pip install -r requirements.txt
 - `tests/`
   - Test coverage for provided cases and additional edge cases.
 
+## Solution architecture
+
+This solution is implemented as a deterministic pipeline in `feasibility/engine.py` with data models in `feasibility/models.py`.
+
+1. Input parsing
+   - `run.py` loads the case JSON files and constructs typed objects: `Client`, `Offer`, and `CreditorRules`.
+   - `models.py` provides JSON deserialization, date helpers, and `default_first_payment_date()`.
+
+2. Offer and fee computation
+   - `_offer_total()` computes the creditor payment total from `offer.current_balance_cents` and `offer.settlement_pct`.
+   - `_program_fee_total()` computes the total program fee from `offer.original_balance_cents` and `rules.program_fee_pct`.
+   - Both use `_round_half_up()` with `Decimal` to ensure exact round-half-up behavior.
+
+3. Cadence generation
+   - `_cadence_to_horizon()` builds the payment cadence up to `client.last_draft_date`.
+   - It preserves true end-of-month recurrence when the first payment date is month-end, otherwise it uses month-day clamping.
+
+4. Candidate schedule generation
+   - `_choose_best_schedule()` iterates `k` from 1 to `min(rules.max_terms, rules.max_payments)`.
+   - For each `k`, it generates candidates using:
+     - `_generate_even_payments()` for `even_pays`,
+     - `_generate_balloon_payments()` when ballooning is permitted,
+     - `_generate_staircase_payments()` otherwise.
+   - Each generator returns either a valid payment vector or `None`.
+
+5. Rule validation
+   - `_is_valid_payment_sequence()` checks non-negative payments, non-decreasing order, token-pay limits, and position-based floor rules.
+   - `_payment_floor()` computes the applicable floor from `min_payment_cents` and `min_payment_tiers`.
+   - `_count_token_pays()` enforces `max_token_pays`.
+
+6. Balance path construction
+   - `_build_fixed_balance_path()` merges future ledger entries, extra funding, and creditor payments with bank fees.
+   - It simulates balance progression over sorted dates and returns `fixed_balance` only if the balance never goes negative.
+
+7. Fee allocation and schedule simulation
+   - `_allocate_program_fee()` greedily assigns program fees to earliest allowable dates while preserving the future balance path.
+   - `_simulate_schedule()` rebuilds the date-by-date ledger including fee allocations, and returns `ScheduleRow` output if the balance remains non-negative.
+
+8. Schedule ranking
+   - `_try_schedule()` evaluates a candidate schedule and returns a metric tuple containing a negative fee allocation vector and the payment count.
+   - `_choose_best_schedule()` picks the lowest metric, so schedules with earlier fee collection are preferred, with shape rank as a final tie-breaker.
+
+9. Recovery calculation
+   - If no feasible schedule is found, `evaluate_offer()` calls `_find_minimum_lump_sum()` and `_find_minimum_monthly_increment()`.
+   - These use binary search over candidate extra funding amounts and `_is_schedule_feasible_with_extras()` to test feasibility.
+   - Guardrail limits are applied to lump sum and monthly increment results.
+
 ## Usage
 
 Evaluate an example case:
