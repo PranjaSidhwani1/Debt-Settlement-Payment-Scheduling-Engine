@@ -38,50 +38,112 @@ pip install -r requirements.txt
 
 ## Solution architecture
 
-This solution is implemented as a deterministic pipeline in `feasibility/engine.py` with data models in `feasibility/models.py`.
+The engine is implemented as a deterministic scheduling pipeline with three main layers:
 
-1. Input parsing
-   - `run.py` loads the case JSON files and constructs typed objects: `Client`, `Offer`, and `CreditorRules`.
-   - `models.py` provides JSON deserialization, date helpers, and `default_first_payment_date()`.
+- **Input & model layer** (`run.py`, `feasibility/models.py`)
+- **Schedule generation layer** (`feasibility/engine.py` payment candidate builders)
+- **Balance validation layer** (`feasibility/engine.py` fee allocation + ledger simulation)
 
-2. Offer and fee computation
-   - `_offer_total()` computes the creditor payment total from `offer.current_balance_cents` and `offer.settlement_pct`.
-   - `_program_fee_total()` computes the total program fee from `offer.original_balance_cents` and `rules.program_fee_pct`.
-   - Both use `_round_half_up()` with `Decimal` to ensure exact round-half-up behavior.
+### Component responsibilities
 
-3. Cadence generation
-   - `_cadence_to_horizon()` builds the payment cadence up to `client.last_draft_date`.
-   - It preserves true end-of-month recurrence when the first payment date is month-end, otherwise it uses month-day clamping.
+- `run.py`
+  - Reads the case folder and loads `client.json`, `offer.json`, and `creditor_rules.json`.
+  - Converts JSON into typed domain objects and dispatches `evaluate_offer()`.
+  - Prints the final JSON output.
 
-4. Candidate schedule generation
-   - `_choose_best_schedule()` iterates `k` from 1 to `min(rules.max_terms, rules.max_payments)`.
-   - For each `k`, it generates candidates using:
-     - `_generate_even_payments()` for `even_pays`,
-     - `_generate_balloon_payments()` when ballooning is permitted,
-     - `_generate_staircase_payments()` otherwise.
-   - Each generator returns either a valid payment vector or `None`.
+- `feasibility/models.py`
+  - Defines `Client`, `Offer`, `CreditorRules`, ledger entry types, and output schemas.
+  - Implements date helper functions, cadence generation, and JSON parsing.
+  - Provides `default_first_payment_date()` and horizon-aware date utilities.
 
-5. Rule validation
-   - `_is_valid_payment_sequence()` checks non-negative payments, non-decreasing order, token-pay limits, and position-based floor rules.
-   - `_payment_floor()` computes the applicable floor from `min_payment_cents` and `min_payment_tiers`.
-   - `_count_token_pays()` enforces `max_token_pays`.
+- `feasibility/engine.py`
+  - Implements the core solver with a tight, deterministic search over allowed schedule options.
+  - Computes offer totals, generates payment vectors, validates creditor rules, allocates fees, and simulates the escrow ledger.
 
-6. Balance path construction
-   - `_build_fixed_balance_path()` merges future ledger entries, extra funding, and creditor payments with bank fees.
-   - It simulates balance progression over sorted dates and returns `fixed_balance` only if the balance never goes negative.
+### High-level data flow
 
-7. Fee allocation and schedule simulation
-   - `_allocate_program_fee()` greedily assigns program fees to earliest allowable dates while preserving the future balance path.
-   - `_simulate_schedule()` rebuilds the date-by-date ledger including fee allocations, and returns `ScheduleRow` output if the balance remains non-negative.
+1. Parse inputs into domain objects.
+2. Compute `offer_total` and `program_fee_total` using exact round-half-up arithmetic in cents.
+3. Build the candidate payment cadence from `offer.first_payment_date` up to `client.last_draft_date`.
+4. Enumerate feasible `k` values: `1 .. min(rules.max_terms, rules.max_payments)` while staying within the cadence horizon.
+5. For each `k`, build payment amount candidates for the allowed shapes.
+6. Validate each candidate against floor rules, token-pay caps, tier minimums, non-decreasing order, and exact sum.
+7. For valid payment vectors, allocate program fees to earliest allowable dates and simulate the complete ledger.
+8. Select the best schedule by comparing fee collection timing and shape rank.
+9. If no feasible schedule exists, compute recovery options and return infeasibility.
 
-8. Schedule ranking
-   - `_try_schedule()` evaluates a candidate schedule and returns a metric tuple containing a negative fee allocation vector and the payment count.
-   - `_choose_best_schedule()` picks the lowest metric, so schedules with earlier fee collection are preferred, with shape rank as a final tie-breaker.
+### Payment schedule generation
 
-9. Recovery calculation
-   - If no feasible schedule is found, `evaluate_offer()` calls `_find_minimum_lump_sum()` and `_find_minimum_monthly_increment()`.
-   - These use binary search over candidate extra funding amounts and `_is_schedule_feasible_with_extras()` to test feasibility.
-   - Guardrail limits are applied to lump sum and monthly increment results.
+The solver supports three schedule shapes depending on creditor rules:
+
+- `even`
+  - Uses `_generate_even_payments()`.
+  - Divides `offer_total` by `k` and distributes the remainder to later payments.
+  - Ensures the sequence is non-decreasing and respects minimums.
+
+- `balloon`
+  - Uses `_generate_balloon_payments()` when `rules.is_ballooning_allowed` is true.
+  - Assigns the earliest payments as close to the minimum allowed as possible.
+  - Allocates the remaining balance into the final payment.
+  - Valid only when token-pay and tier constraints remain satisfied.
+
+- `staircase`
+  - Uses `_generate_staircase_payments()` when ballooning is not required or even payments are disabled.
+  - Builds a monotonic sequence with at most `rules.max_segments` distinct payment levels.
+  - Enforces floors and relies on a deterministic step allocation strategy.
+
+### Constraint validation
+
+Each candidate vector is checked by `_is_valid_payment_sequence()`:
+
+- All payments must be ≥ 0.
+- Sequence must be non-decreasing.
+- Sum of payments must equal `offer_total` exactly.
+- Each payment must meet its position-specific floor from `min_payment_cents` and `min_payment_tiers`.
+- The number of token payments equal to `min_payment_cents` must not exceed `rules.max_token_pays`.
+
+Floor calculations are centralized in `_payment_floor()` to keep tier logic deterministic.
+
+### Fee allocation strategy
+
+The program fee is allocated as early as possible once a payment layout is selected.
+
+- `_allocate_program_fee()` takes a proposed payment schedule and the candidate balance path.
+- It greedily charges program fees on payment dates while preserving non-negative balance after bank fee and creditor payment.
+- If the full fee cannot be charged on payment dates, the algorithm can extend allocation to additional fee-only dates before horizon.
+
+This is the core mechanism that makes the chosen schedule “best” under the fee timing objective.
+
+### Ledger simulation
+
+Ledger validation is performed with a chronological event stream:
+
+- Existing future ledger entries from `client.ledger` are included.
+- Creditor payments, bank fees, and program fees are inserted at their scheduled dates.
+- Events are sorted by date.
+- On each date, all credits are applied before debits.
+- The running balance is checked after each event to ensure it never goes negative.
+
+This simulation is implemented in `_simulate_schedule()` and `_build_fixed_balance_path()`.
+
+### Schedule ranking
+
+The solver compares feasible candidates using a structured metric:
+
+- Primary: fee allocation timing (earlier fee collection is better).
+- Secondary: payment count and payment shape preference.
+- Tertiary: deterministic tie-breaking to ensure repeatable output.
+
+The ranking logic is centralized in `_try_schedule()` and `_choose_best_schedule()`.
+
+### Infeasibility and recovery
+
+When no schedule is feasible, the engine computes deterministic recovery options:
+
+- Minimum lump sum required to make a feasible schedule possible.
+- Minimum monthly increment to future drafts required to restore feasibility.
+
+Recovery result generation uses guarded binary search and explicit guardrail checks, ensuring the output stays aligned with the intended assignment behavior.
 
 ## Usage
 
